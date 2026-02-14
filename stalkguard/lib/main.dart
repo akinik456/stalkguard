@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -44,19 +46,50 @@ class _HomePageState extends State<HomePage> {
   final FlutterLocalNotificationsPlugin _notifs = FlutterLocalNotificationsPlugin();
   static const String _alertChannelId = "stalkguard_alerts_v2";
   final Map<String, DateTime> _lastAlertAtById = {};
-  static const Duration _alertCooldown = Duration(minutes: 10);
+  static const Duration _alertCooldown = Duration(minutes: 2); // test için hızlı
+
+  Timer? _cleanupTimer;
+
+  bool _scanning = true; // kurulumdan sonra default tarasın
 
   @override
   void initState() {
     super.initState();
     _init();
+    _startCleanupTimer();
+  }
+
+  @override
+  void dispose() {
+    _cleanupTimer?.cancel();
+    super.dispose();
+  }
+
+  void _startCleanupTimer() {
+    _cleanupTimer = Timer.periodic(const Duration(seconds: 10), (_) {
+      final now = DateTime.now();
+      bool changed = false;
+
+      _deviceMap.removeWhere((_, d) {
+        final stale = now.difference(d.lastSeen).inSeconds > 60; // 1 dk
+        if (stale) changed = true
+        ;
+        return stale;
+      });
+
+      if (changed && mounted) {
+        setState(() {
+          _sortDevicesByRiskDesc();
+        });
+      }
+    });
   }
 
   Future<void> _initNotifications() async {
     const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
     const initSettings = InitializationSettings(android: androidInit);
 
-    // Senin plugin sürümün: initialize 1 positional arg istiyor
+    // senin sürüm: initialize positional
     await _notifs.initialize(initSettings);
 
     const channel = AndroidNotificationChannel(
@@ -71,6 +104,15 @@ class _HomePageState extends State<HomePage> {
     await androidPlugin?.createNotificationChannel(channel);
   }
 
+  void _sortDevicesByRiskDesc() {
+    devices = _deviceMap.values.toList()
+      ..sort((a, b) {
+        final riskA = ThreatEngine.calculateRisk(a);
+        final riskB = ThreatEngine.calculateRisk(b);
+        return riskB.compareTo(riskA);
+      });
+  }
+
   Future<void> _showAlert(DeviceModel d, double risk) async {
     const androidDetails = AndroidNotificationDetails(
       _alertChannelId,
@@ -78,26 +120,37 @@ class _HomePageState extends State<HomePage> {
       channelDescription: 'High risk BLE tracking alerts',
       importance: Importance.max,
       priority: Priority.high,
-      icon: '@mipmap/ic_launcher',
+      icon: 'ic_stat_alarm',
+      color: Color(0xFFFF0000),
     );
 
     const details = NotificationDetails(android: androidDetails);
 
+    // senin sürüm: show 4 positional
     await _notifs.show(
-  d.id.hashCode,
-  "StalkGuard: Şüpheli cihaz",
-  "${d.name} | Risk: ${risk.toInt()}% | RSSI(avg): ${d.avgRssi.toStringAsFixed(0)}",
-  details,
-);
-
+      d.id.hashCode,
+      "StalkGuard: Şüpheli cihaz",
+      "${d.name} | Risk: ${risk.toInt()}% | RSSI(avg): ${d.avgRssi.toStringAsFixed(0)}",
+      details,
+    );
   }
 
   void _maybeAlert(DeviceModel d, double risk) {
     if (_trusted.contains(d.id)) return;
-    if (d.rssiHistory.length < 8) return;
-    if (risk < 70) return;
 
     final now = DateTime.now();
+
+    // hızlı test: 2 dk beraberlik
+    final ageSec = now.difference(d.firstSeen).inSeconds;
+    if (ageSec < 120) return;
+
+    if (d.seenCount < 12) return;
+    if (d.rssiHistory.length < 10) return;
+
+    if (d.avgRssi < -78) return;
+
+    if (risk < 75) return;
+
     final last = _lastAlertAtById[d.id];
     if (last != null && now.difference(last) < _alertCooldown) return;
 
@@ -138,7 +191,9 @@ class _HomePageState extends State<HomePage> {
 
     if (ok) {
       BleBridge.startService();
-      BleBridge.startScan();
+      if (_scanning) BleBridge.startScan();
+    } else {
+      setState(() => _scanning = false);
     }
 
     BleBridge.listen((data) {
@@ -150,66 +205,65 @@ class _HomePageState extends State<HomePage> {
           ? data["rssi"]
           : int.tryParse(data["rssi"].toString()) ?? -127;
 
-      DeviceModel? updated;
+      final now = DateTime.now();
+
+      DeviceModel updated;
 
       setState(() {
         if (_deviceMap.containsKey(id)) {
-          final existing = _deviceMap[id]!;
+          final ex = _deviceMap[id]!;
 
-          final newHist = List<int>.from(existing.rssiHistory);
+          final newHist = List<int>.from(ex.rssiHistory);
           newHist.add(rssi);
           if (newHist.length > 20) newHist.removeAt(0);
 
           updated = DeviceModel(
-            id: existing.id,
-            name: (existing.name == "Unknown" && name != "Unknown")
-                ? name
-                : existing.name,
+            id: ex.id,
+            name: (ex.name == "Unknown" && name != "Unknown") ? name : ex.name,
             rssi: rssi,
-            lastSeen: DateTime.now(),
-            seenCount: existing.seenCount + 1,
-            firstSeen: existing.firstSeen,
+            lastSeen: now,
+            seenCount: ex.seenCount + 1,
+            firstSeen: ex.firstSeen,
             rssiHistory: newHist,
           );
 
-          _deviceMap[id] = updated!;
+          _deviceMap[id] = updated;
         } else {
           updated = DeviceModel(
             id: id,
             name: name,
             rssi: rssi,
-            lastSeen: DateTime.now(),
+            lastSeen: now,
             seenCount: 1,
             rssiHistory: [rssi],
           );
 
-          _deviceMap[id] = updated!;
+          _deviceMap[id] = updated;
         }
 
-        devices = _deviceMap.values.toList()
-  ..sort((a, b) {
-    final riskA = ThreatEngine.calculateRisk(a);
-    final riskB = ThreatEngine.calculateRisk(b);
-    return riskB.compareTo(riskA); // yüksek risk üste
-  });
-
+        _sortDevicesByRiskDesc();
       });
 
-      if (updated != null) {
-        final risk = ThreatEngine.calculateRisk(updated!);
-        _maybeAlert(updated!, risk);
-      }
+      final risk = ThreatEngine.calculateRisk(_deviceMap[id]!);
+      _maybeAlert(_deviceMap[id]!, risk);
     });
   }
 
-  // Android 12: notification izni şart değil (pop-up yok), ama yine isteyebiliriz.
   Future<bool> _ensurePermissions() async {
     final scan = await Permission.bluetoothScan.request();
     final connect = await Permission.bluetoothConnect.request();
     final loc = await Permission.locationWhenInUse.request();
     await Permission.notification.request();
-
     return scan.isGranted && connect.isGranted && loc.isGranted;
+  }
+
+  void _toggleScan() {
+    setState(() => _scanning = !_scanning);
+    if (_scanning) {
+      BleBridge.startScan();
+    } else {
+      BleBridge.stopScan();
+    }
   }
 
   @override
@@ -222,14 +276,24 @@ class _HomePageState extends State<HomePage> {
         children: [
           ListTile(
             title: Text(permStatus),
-            subtitle: const Text("Bluetooth + Konum açık olmalı"),
-            trailing: TextButton(
-              onPressed: () async {
-                final ok = await _ensurePermissions();
-                setState(() => permStatus = ok ? "İzinler OK" : "İzinler eksik");
-                if (ok) BleBridge.startScan();
-              },
-              child: const Text("İzinleri Yenile"),
+            subtitle: Text(_scanning ? "Tarama: AÇIK" : "Tarama: KAPALI"),
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                OutlinedButton(
+                  onPressed: _toggleScan,
+                  child: Text(_scanning ? "Durdur" : "Başlat"),
+                ),
+                const SizedBox(width: 8),
+                TextButton(
+                  onPressed: () async {
+                    final ok = await _ensurePermissions();
+                    setState(() => permStatus = ok ? "İzinler OK" : "İzinler eksik");
+                    if (ok && _scanning) BleBridge.startScan();
+                  },
+                  child: const Text("İzinleri Yenile"),
+                ),
+              ],
             ),
           ),
           const Divider(height: 1),

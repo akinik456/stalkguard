@@ -19,7 +19,7 @@ class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        // ✅ UI engine’i cache’e koy (Servis buradan alacak)
+        // Servis Flutter UI'ya kanal açabilsin diye cache
         FlutterEngineCache.getInstance().put(ENGINE_ID, flutterEngine)
 
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
@@ -32,6 +32,12 @@ class MainActivity : FlutterActivity() {
                 "startScan" -> {
                     val i = Intent(this, BleForegroundService::class.java)
                     i.action = "START_SCAN"
+                    ContextCompat.startForegroundService(this, i)
+                    result.success(true)
+                }
+                "stopScan" -> {
+                    val i = Intent(this, BleForegroundService::class.java)
+                    i.action = "STOP_SCAN"
                     ContextCompat.startForegroundService(this, i)
                     result.success(true)
                 }

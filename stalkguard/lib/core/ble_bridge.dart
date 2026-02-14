@@ -6,19 +6,14 @@ class BleBridge {
   static void startService() {
     _channel.invokeMethod("startService");
   }
-  
+
   static void startScan() {
-  _channel.invokeMethod("startScan");
-}
+    _channel.invokeMethod("startScan");
+  }
 
-static Future<void> notify(String title, String body) async {
-  await _channel.invokeMethod("notify", {
-    "title": title,
-    "body": body,
-  });
-}
-
-
+  static void stopScan() {
+    _channel.invokeMethod("stopScan");
+  }
 
   static void listen(Function(dynamic) onDevice) {
     _channel.setMethodCallHandler((call) async {
