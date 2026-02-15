@@ -18,6 +18,7 @@ android {
 	dependencies {
     // 2.0.3 yerine en güncel stabil sürümlerden biri olan 2.1.4'ü yazıyoruz
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
+	implementation ("com.google.android.gms:play-services-location:21.0.1")
 }
     // KOTLIN'I DE 1.8 YAPIYORUZ (Hatanın çözümü burası)
     kotlinOptions {

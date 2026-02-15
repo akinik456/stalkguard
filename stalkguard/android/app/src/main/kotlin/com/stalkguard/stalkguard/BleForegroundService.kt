@@ -10,8 +10,10 @@ import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Handler
 import android.os.IBinder
@@ -25,6 +27,8 @@ import io.flutter.plugin.common.MethodChannel
 class BleForegroundService : Service() {
 
     private lateinit var scanner: BluetoothLeScanner
+    private lateinit var btManager: BluetoothManager
+    private lateinit var adapter: BluetoothAdapter
 
     private val notifId = 1
     private val notifChannelId = "stalkguard_channel"
@@ -32,25 +36,36 @@ class BleForegroundService : Service() {
     private val ENGINE_ID = "stalkguard_ui_engine"
     private var channel: MethodChannel? = null
 
-    // --- WDT (akıllı watchdog) ---
+    // --- WDT (smart watchdog) ---
     private val watchdogHandler = Handler(Looper.getMainLooper())
     private var watchdogRunning = false
     private var lastScanMs: Long = 0L
-    private var isScanning: Boolean = false
 
-    private val WATCHDOG_CHECK_MS = 30_000L      // 30 sn'de bir kontrol
-    private val SCAN_STALE_MS = 2 * 60_000L      // 2 dk sonuç yoksa reset
+    // user intent: scan ON/OFF
+    private var scanWanted: Boolean = false
+
+    // bt state
+    private var btOn: Boolean = true
+    private var btReceiverRegistered: Boolean = false
+
+    private val WATCHDOG_CHECK_MS = 30_000L      // check every 30s
+    private val SCAN_STALE_MS = 2 * 60_000L      // if no results for 2 min => restart scan (only if BT ON)
 
     private val watchdogRunnable = object : Runnable {
         override fun run() {
-            if (!watchdogRunning || !isScanning) return
+            if (!watchdogRunning || !scanWanted) return
+
+            // if BT is OFF, do nothing (no pointless resets)
+            if (!isBluetoothReady()) {
+                watchdogHandler.postDelayed(this, WATCHDOG_CHECK_MS)
+                return
+            }
 
             val now = System.currentTimeMillis()
             val stale = (now - lastScanMs) > SCAN_STALE_MS
             if (stale) {
-                // Scan takıldıysa resetle
                 try { scanner.stopScan(scanCallback) } catch (_: Exception) {}
-                try { startScanningInternal() } catch (_: Exception) {}
+                try { startScanInternal() } catch (_: Exception) {}
                 markScanSeen()
             }
 
@@ -58,11 +73,33 @@ class BleForegroundService : Service() {
         }
     }
 
+    // --- BT state receiver ---
+    private val btStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
+
+            val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
+            btOn = (state == BluetoothAdapter.STATE_ON)
+
+            // notify Flutter UI if available
+            channel?.invokeMethod("onBtState", hashMapOf("on" to btOn))
+
+            // update foreground notification text
+            updateForegroundStatus()
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
-        startForegroundNotification()
         setupBleScanner()
+
+        // initial bt state
+        btOn = isBluetoothReady()
+
+        startForegroundNotification()
         attachToUiEngineIfAvailable()
+
+        registerBtReceiverIfNeeded()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -70,12 +107,15 @@ class BleForegroundService : Service() {
             "START_SCAN" -> {
                 attachToUiEngineIfAvailable()
                 startScanning()
+                updateForegroundStatus() // Active/Passive + BT ON/OFF
             }
             "STOP_SCAN" -> {
                 stopScanning()
+                updateForegroundStatus()
             }
             else -> {
-                // sadece servis ayağa kalktı
+                // service started
+                updateForegroundStatus()
             }
         }
         return START_STICKY
@@ -85,24 +125,34 @@ class BleForegroundService : Service() {
         val engine: FlutterEngine? = FlutterEngineCache.getInstance().get(ENGINE_ID)
         if (engine != null) {
             channel = MethodChannel(engine.dartExecutor.binaryMessenger, "stalkguard_ble")
+
+            // send current BT state once UI attaches
+            channel?.invokeMethod("onBtState", hashMapOf("on" to btOn))
         }
+    }
+
+    private fun registerBtReceiverIfNeeded() {
+        if (btReceiverRegistered) return
+        try {
+            registerReceiver(btStateReceiver, IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED))
+            btReceiverRegistered = true
+        } catch (_: Exception) {}
     }
 
     private fun startForegroundNotification() {
         val manager = getSystemService(NotificationManager::class.java)
 
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
+            val ch = NotificationChannel(
                 notifChannelId,
                 "StalkGuard Service",
                 NotificationManager.IMPORTANCE_LOW
             )
-            manager.createNotificationChannel(channel)
+            manager.createNotificationChannel(ch)
         }
 
-        // sadece "StalkGuard Aktif"
         val notification = NotificationCompat.Builder(this, notifChannelId)
-            .setContentTitle("StalkGuard Aktif")
+            .setContentTitle(buildForegroundTitle())
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -111,10 +161,36 @@ class BleForegroundService : Service() {
         startForeground(notifId, notification)
     }
 
+    private fun buildForegroundTitle(): String {
+        val scanText = if (scanWanted) "Active" else "Passive"
+        val btText = if (btOn) "Bluetooth ON" else "Bluetooth OFF"
+        return "StalkGuard $scanText • $btText"
+    }
+
+    private fun updateForegroundStatus() {
+        val notification = NotificationCompat.Builder(this, notifChannelId)
+            .setContentTitle(buildForegroundTitle())
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .build()
+
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.notify(notifId, notification)
+    }
+
     private fun setupBleScanner() {
-        val manager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-        val adapter: BluetoothAdapter = manager.adapter
+        btManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+        adapter = btManager.adapter
         scanner = adapter.bluetoothLeScanner
+    }
+
+    private fun isBluetoothReady(): Boolean {
+        return try {
+            adapter.isEnabled && adapter.bluetoothLeScanner != null
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun markScanSeen() {
@@ -134,14 +210,9 @@ class BleForegroundService : Service() {
     }
 
     private fun startScanning() {
-        if (isScanning) return
-        startScanningInternal()
-        isScanning = true
-        markScanSeen()
+        scanWanted = true
         startWatchdogIfNeeded()
-    }
 
-    private fun startScanningInternal() {
         val hasScanPerm = ContextCompat.checkSelfPermission(
             this,
             Manifest.permission.BLUETOOTH_SCAN
@@ -149,26 +220,31 @@ class BleForegroundService : Service() {
 
         if (!hasScanPerm) return
 
+        // BT OFF => just wait, WDT will keep checking
+        if (!isBluetoothReady()) return
+
+        startScanInternal()
+        markScanSeen()
+    }
+
+    private fun startScanInternal() {
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
 
-        // Not: startScan çağrısı başarısız olursa exception atabilir; yutuyoruz
         try {
             scanner.startScan(null, settings, scanCallback)
         } catch (_: Exception) {}
     }
 
     private fun stopScanning() {
-        if (!isScanning) return
-        isScanning = false
+        scanWanted = false
         stopWatchdog()
         try { scanner.stopScan(scanCallback) } catch (_: Exception) {}
     }
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
-            // her sonuç geldiğinde "scan yaşıyor" işaretle
             markScanSeen()
 
             val device = result.device
@@ -189,6 +265,11 @@ class BleForegroundService : Service() {
         super.onDestroy()
         stopScanning()
         stopWatchdog()
+
+        if (btReceiverRegistered) {
+            try { unregisterReceiver(btStateReceiver) } catch (_: Exception) {}
+            btReceiverRegistered = false
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
